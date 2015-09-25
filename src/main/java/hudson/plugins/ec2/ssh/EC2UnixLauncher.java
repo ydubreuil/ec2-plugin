@@ -81,22 +81,20 @@ public class EC2UnixLauncher extends EC2ComputerLauncher {
 
     @Override
 	protected void launch(EC2Computer computer, TaskListener listener, Instance inst) throws IOException, AmazonClientException, InterruptedException {
-        final Connection bootstrapConn;
         final Connection conn;
         Connection cleanupConn = null; // java's code path analysis for final doesn't work that well.
         boolean successful = false;
         PrintStream logger = listener.getLogger();
 
         try {
-            bootstrapConn = connectToSsh(computer, logger);
-            int bootstrapResult = bootstrap(bootstrapConn, computer, logger);
-            if (bootstrapResult == FAILED) {
+            BootstrapStatus bootstrapStatus = bootstrap(computer, logger);
+            if (bootstrapStatus.getStatus() == FAILED) {
             	logger.println("bootstrapresult failed");
                 return; // bootstrap closed for us.
             }
-            else if (bootstrapResult == SAMEUSER) {
-                cleanupConn = bootstrapConn; // take over the connection
-                logger.println("take over connection");
+            else if (bootstrapStatus.getStatus() == SAMEUSER) {
+                cleanupConn = bootstrapStatus.getConn(); // take over the connection
+                logger.println("Authenticated, using the same ssh connection.");
             }
             else {
                 // connect fresh as ROOT
@@ -247,9 +245,11 @@ public class EC2UnixLauncher extends EC2ComputerLauncher {
         }
     }
 
-    private int bootstrap(Connection bootstrapConn, EC2Computer computer, PrintStream logger) throws IOException, InterruptedException, AmazonClientException {
+	private BootstrapStatus bootstrap(EC2Computer computer, PrintStream logger) throws IOException, InterruptedException, AmazonClientException {
         logger.println("bootstrap()" );
-        boolean closeBootstrap = true;
+        BootstrapStatus bootstrapStatus = new BootstrapStatus();
+        Connection conn = connectToSsh(computer, logger);
+        bootstrapStatus.setConn(conn);
         try {
             int tries = 20;
             boolean isAuthenticated = false;
@@ -258,22 +258,30 @@ public class EC2UnixLauncher extends EC2ComputerLauncher {
             logger.println("Using key: " + key.getKeyName() + "\n" + key.getKeyFingerprint() + "\n" + key.getKeyMaterial().substring(0, 160) );
             while (tries-- > 0) {
                 logger.println("Authenticating as " + computer.getRemoteAdmin());
-                isAuthenticated = bootstrapConn.authenticateWithPublicKey(computer.getRemoteAdmin(), key.getKeyMaterial().toCharArray(), "");
+                isAuthenticated = conn.authenticateWithPublicKey(computer.getRemoteAdmin(), key.getKeyMaterial().toCharArray(), "");
                 if (isAuthenticated) {
                     break;
                 }
                 logger.println("Authentication failed. Trying again...");
-                Thread.sleep(10000);
+                conn.close();
+                Integer retryAuthTimeout = Integer.getInteger("jenkins.ec2.retryAuthTimeout", 30000);
+                logger.println("Sleeping for "+retryAuthTimeout/1000+"s before trying again.");
+                Thread.sleep(retryAuthTimeout);
+                conn = connectToSsh(computer, logger);
+                bootstrapStatus.setConn(conn);
             }
             if (!isAuthenticated) {
                 logger.println("Authentication failed");
-                return FAILED;
+                bootstrapStatus.setStatus(FAILED);
+                return bootstrapStatus;
             }
-            closeBootstrap = false;
-            return SAMEUSER;
+
+            bootstrapStatus.setStatus(SAMEUSER);
+            return bootstrapStatus;
         } finally {
-            if (closeBootstrap)
-                bootstrapConn.close();
+        	if (bootstrapStatus.getStatus() != SAMEUSER) {
+        		conn.close();
+        	}
         }
     }
 
@@ -356,5 +364,23 @@ public class EC2UnixLauncher extends EC2ComputerLauncher {
     @Override
 	public Descriptor<ComputerLauncher> getDescriptor() {
         throw new UnsupportedOperationException();
+    }
+
+    public static class BootstrapStatus {
+        int status;
+        Connection conn;
+
+        public int getStatus() {
+            return status;
+        }
+        public void setStatus(int status) {
+            this.status = status;
+        }
+        public Connection getConn() {
+            return conn;
+        }
+        public void setConn(Connection conn) {
+            this.conn = conn;
+        }
     }
 }
